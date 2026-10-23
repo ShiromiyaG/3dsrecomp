@@ -2,6 +2,7 @@
 //! installing the library, for the command line and for programs that run
 //! it themselves and follow it through its events.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -42,6 +43,9 @@ pub struct Options<'a> {
     /// compile below normal priority and leave a core, for a game being
     /// played meanwhile.
     pub background: bool,
+    /// Zakuro's heat for the title: build only the functions that cover
+    /// nearly all of it, quickly, see hot.rs.
+    pub hot: Option<&'a Path>,
 }
 
 /// the title's code written as C.
@@ -59,6 +63,7 @@ pub fn generate(
     pick: impl FnOnce(&Title) -> PathBuf,
     overrides: Option<&Path>,
     mods: Mods,
+    hot: Option<&Path>,
     events: &(dyn Fn(Event) + Sync),
 ) -> Result<Generated, String> {
     let title = Title::load(rom).map_err(|error| format!("could not load {}, {error}", rom.display()))?;
@@ -97,6 +102,22 @@ pub fn generate(
             )));
         }
     }
+    if let Some(hot) = hot {
+        let heat = crate::hot::Heat::load(hot)?;
+        let selection = crate::hot::select(&programs, &analyses, &heat, crate::hot::SHARE);
+        let mut also: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
+        for item in &replaced {
+            let index = programs.iter().position(|(name, _)| Some(name.as_str()) == item.module.as_deref()).unwrap_or(0);
+            also.entry(index).or_default().insert(item.address & !1);
+        }
+        crate::hot::prune(&mut analyses, &selection.keep, &also);
+        events(Event::Note(format!(
+            "building the {} hottest of {} functions, {:.1}% of where the game spends its time",
+            selection.functions,
+            selection.of,
+            selection.covered * 100.0
+        )));
+    }
     let units: Vec<codegen::Unit> = programs
         .iter()
         .zip(&analyses)
@@ -129,8 +150,14 @@ pub fn generate(
 pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> Result<PathBuf, String> {
     let compiler = compile::check(options.compiler.as_ref())?;
     let stopped = || options.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
-    let pick = |title: &Title| options.dir.map(Path::to_owned).unwrap_or_else(|| cache_dir(title.program_id()));
-    let generated = generate(rom, pick, options.overrides, options.mods, events)?;
+    // a hot build works apart from the full one, whose objects it would
+    // otherwise replace
+    let pick = |title: &Title| {
+        let cache = cache_dir(title.program_id());
+        let cache = if options.hot.is_some() { cache.with_file_name(format!("{:016X}-hot", title.program_id())) } else { cache };
+        options.dir.map(Path::to_owned).unwrap_or(cache)
+    };
+    let generated = generate(rom, pick, options.overrides, options.mods, options.hot, events)?;
     if stopped() {
         return Err("stopped".to_owned());
     }
@@ -333,7 +360,7 @@ mod tests {
         let (code, module) = (bytes(&modded), named("Battle", &modded));
         let romfs = |path: &str| (path == "cro/Battle.cro").then(|| module.clone());
         let tables = |mods: Mods| {
-            generate(&path, |_| dir.clone(), None, mods, &|_| {}).unwrap();
+            generate(&path, |_| dir.clone(), None, mods, None, &|_| {}).unwrap();
             std::fs::read_to_string(dir.join("entries.c")).unwrap()
         };
 

@@ -25,6 +25,7 @@ pub mod codegen;
 pub mod compile;
 pub mod cro;
 pub mod discover;
+pub mod hot;
 pub mod image;
 pub mod overrides;
 pub mod port;

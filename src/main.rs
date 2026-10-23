@@ -25,7 +25,9 @@ usage, 3dsrecomp analyze <rom>
        3dsrecomp hints <rom> [<hints file>]
 each takes --mods <dir>, a mod or an unpacked update laid out the way
 Luma3DS has them, code.bin (decompressed, or in exefs/), exheader.bin and
-romfs/, read in place of the game's own code and modules.
+romfs/, read in place of the game's own code and modules. build and port
+take --hot <file>, the heat Zakuro --heat wrote, to build only the
+functions the game spends nearly all its time in, in a fraction of the time.
 
 build without a dir works in the cache and installs the library where
 Zakuro finds it on its own. hints prints the game's section for hints.txt,
@@ -42,6 +44,8 @@ struct Options {
     zakuro: Option<PathBuf>,
     /// what a mod's folder changes in the title.
     mods: Option<ModDir>,
+    /// Zakuro's heat, to build only the hottest functions.
+    hot: Option<PathBuf>,
 }
 
 impl Options {
@@ -95,6 +99,7 @@ fn main() {
             "--name" => options.name = Some(value()),
             "--zakuro" => options.zakuro = Some(value().into()),
             "--mods" => options.mods = Some(ModDir::read(Path::new(&value()))),
+            "--hot" => options.hot = Some(value().into()),
             other if other.starts_with("--") => {
                 eprintln!("unknown option {other}\n{USAGE}");
                 exit(2);
@@ -175,8 +180,13 @@ fn hints(path: &str, file: Option<&Path>, options: &Options) {
 /// installs it where hosts look for it.
 fn build(path: &str, given: Option<&Path>, options: &Options) {
     let files = |path: &str| options.mod_file(path);
-    let build_options =
-        build::Options { dir: given, overrides: options.overrides.as_deref(), mods: options.mods(&files), ..build::Options::default() };
+    let build_options = build::Options {
+        dir: given,
+        overrides: options.overrides.as_deref(),
+        mods: options.mods(&files),
+        hot: options.hot.as_deref(),
+        ..build::Options::default()
+    };
     if let Err(error) = build::build(Path::new(path), &build_options, &print_event) {
         eprintln!("{error}");
         exit(1);
@@ -204,7 +214,7 @@ fn print_event(event: Event) {
 /// a Cargo project at dir that builds the title into a program of its own.
 fn port(path: &str, dir: &Path, options: &Options) {
     let files = |path: &str| options.mod_file(path);
-    let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), options.mods(&files), &print_event)
+    let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), options.mods(&files), options.hot.as_deref(), &print_event)
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             exit(1);
