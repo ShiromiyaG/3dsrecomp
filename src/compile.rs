@@ -24,6 +24,12 @@ const GCC_FLAGS: &[&str] = &["--param", "ggc-min-expand=20", "--param", "ggc-min
 /// memory took around 450 for one of 2.9 MB.
 const MEMORY_PER_BYTE: u64 = 600;
 
+/// the same for clang, and zig cc, which is clang: clang 23 compiling all of
+/// Pokémon Ultra Sun twelve at a time took 132 at the median and 191 at the
+/// 95th percentile. budgeting it as gcc held a 12 thread machine with 8 GB to
+/// spare to five to eight compilers at once.
+const CLANG_MEMORY_PER_BYTE: u64 = 200;
+
 /// what to leave of the memory there is for everything else.
 const RESERVE: u64 = 1 << 30;
 
@@ -199,8 +205,16 @@ pub fn objects(
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = if background { cores.saturating_sub(1).max(1) } else { cores };
     let budget = spare_memory().map(|spare| spare.saturating_sub(RESERVE));
+    let per_byte = if gcc { MEMORY_PER_BYTE } else { CLANG_MEMORY_PER_BYTE };
+    // what every object depends on besides its own C: the compiler, which
+    // says what it is when asked its version, the flags and recomp.h. the
+    // other headers only declare functions, all alike
+    let version = compiler.command().arg("--version").output().map(|output| output.stdout).unwrap_or_default();
+    let header = std::fs::read(dir.join("recomp.h")).unwrap_or_default();
+    let flags = [FLAGS, if gcc { GCC_FLAGS } else { &[] }, if cfg!(windows) { &[][..] } else { UNIX_FLAGS }].concat().join(" ");
+    let base = [compiler.describe().as_bytes(), &version, flags.as_bytes(), &header].iter().fold(FNV_OFFSET, |hash, part| fnv(hash, part));
     let needs: Vec<u64> =
-        sources.iter().map(|source| std::fs::metadata(dir.join(source)).map_or(0, |m| m.len()) * MEMORY_PER_BYTE).collect();
+        sources.iter().map(|source| std::fs::metadata(dir.join(source)).map_or(0, |m| m.len()) * per_byte).collect();
     // the biggest first, so that none of them starts last and holds the
     // others up
     let mut order: Vec<usize> = (0..sources.len()).collect();
@@ -233,6 +247,26 @@ pub fn objects(
                 let Some(index) = index else { break };
                 let source = &sources[index];
                 let path = dir.join(source);
+                // an object compiled before from the same C, with the same
+                // compiler and flags, is kept
+                let key = std::fs::read(&path).ok().map(|bytes| format!("{:016x}", fnv(base, &bytes)));
+                let key_path = path.with_extension("key");
+                let object = path.with_extension("o");
+                let kept = key.as_ref().is_some_and(|key| {
+                    object.is_file() && std::fs::read_to_string(&key_path).is_ok_and(|was| was == *key)
+                });
+                if kept {
+                    if !progress(done.fetch_add(1, Ordering::Relaxed) + 1, sources.len()) {
+                        stopped.store(true, Ordering::Relaxed);
+                    }
+                    let mut state = state.lock().unwrap();
+                    state.1 -= needs[index];
+                    state.2 -= 1;
+                    freed.notify_all();
+                    continue;
+                }
+                // a key is only there for an object that finished
+                let _ = std::fs::remove_file(&key_path);
                 let mut command = compiler.command();
                 if background {
                     lower(&mut command);
@@ -246,10 +280,12 @@ pub fn objects(
                     .arg("-c")
                     .arg(&path)
                     .arg("-o")
-                    .arg(path.with_extension("o"))
+                    .arg(&object)
                     .status();
                 if !status.is_ok_and(|s| s.success()) {
                     failures.lock().unwrap().push(source.clone());
+                } else if let Some(key) = &key {
+                    let _ = std::fs::write(&key_path, key);
                 }
                 if !progress(done.fetch_add(1, Ordering::Relaxed) + 1, sources.len()) {
                     stopped.store(true, Ordering::Relaxed);
@@ -269,6 +305,14 @@ pub fn objects(
         return Err(format!("{} failed to compile, {}", failures.len(), failures.join(" ")));
     }
     Ok(sources.iter().map(|source| dir.join(source).with_extension("o")).collect())
+}
+
+const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+/// 64 bit FNV-1a over bytes, going on from hash, which stays the same from
+/// one build of 3dsrecomp to the next, unlike std's hasher.
+fn fnv(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01B3))
 }
 
 /// links objects into a shared library. on Windows gcc's runtime goes in
