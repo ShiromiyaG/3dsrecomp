@@ -15,7 +15,7 @@ use recomp3ds::discover::{self, Analysis, Byte, Mode, Program, Source};
 use recomp3ds::rom::Title;
 use recomp3ds::{compile, port, Mods};
 #[cfg(feature = "verify")]
-use recomp3ds::{abi, codegen, image, imported, module_files, static_module, verify};
+use recomp3ds::{abi, codegen, image, imported, module_files, rom, static_module, verify};
 
 const USAGE: &str = "\
 usage, 3dsrecomp analyze <rom>
@@ -23,6 +23,9 @@ usage, 3dsrecomp analyze <rom>
        3dsrecomp port <rom> <dir> [--overrides <file or dir>] [--name <name>] [--zakuro <checkout>]
        3dsrecomp verify <rom> <library> [count]
        3dsrecomp hints <rom> [<hints file>]
+each takes --mods <dir>, a mod or an unpacked update laid out the way
+Luma3DS has them, code.bin (decompressed, or in exefs/), exheader.bin and
+romfs/, read in place of the game's own code and modules.
 
 build without a dir works in the cache and installs the library where
 Zakuro finds it on its own. hints prints the game's section for hints.txt,
@@ -37,6 +40,43 @@ struct Options {
     name: Option<String>,
     /// a Zakuro checkout for port to build against.
     zakuro: Option<PathBuf>,
+    /// what a mod's folder changes in the title.
+    mods: Option<ModDir>,
+}
+
+impl Options {
+    /// what the mod changes, files reading its RomFS files.
+    fn mods<'a>(&'a self, files: recomp3ds::Files<'a>) -> Mods<'a> {
+        let Some(dir) = &self.mods else { return Mods::default() };
+        Mods { code: dir.code.as_deref(), exheader: dir.exheader.as_deref(), romfs: dir.romfs.is_some().then_some(files) }
+    }
+
+    /// the RomFS file at path the mod gives, none to keep the title's.
+    fn mod_file(&self, path: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.mods.as_ref()?.romfs.as_ref()?.join(path)).ok()
+    }
+}
+
+/// a mod, or an update unpacked, in a folder laid out the way Luma3DS reads
+/// them: code.bin, decompressed, in it or in exefs/, exheader.bin, and the
+/// RomFS files it replaces under romfs/.
+struct ModDir {
+    code: Option<Vec<u8>>,
+    exheader: Option<Vec<u8>>,
+    romfs: Option<PathBuf>,
+}
+
+impl ModDir {
+    fn read(dir: &Path) -> ModDir {
+        let code = ["code.bin", "exefs/code.bin"].into_iter().find_map(|name| std::fs::read(dir.join(name)).ok());
+        let exheader = std::fs::read(dir.join("exheader.bin")).ok();
+        let romfs = Some(dir.join("romfs")).filter(|romfs| romfs.is_dir());
+        if code.is_none() && exheader.is_none() && romfs.is_none() {
+            eprintln!("{} has no code.bin, exheader.bin or romfs", dir.display());
+            exit(1);
+        }
+        ModDir { code, exheader, romfs }
+    }
 }
 
 fn main() {
@@ -54,6 +94,7 @@ fn main() {
             "--overrides" => options.overrides = Some(value().into()),
             "--name" => options.name = Some(value()),
             "--zakuro" => options.zakuro = Some(value().into()),
+            "--mods" => options.mods = Some(ModDir::read(Path::new(&value()))),
             other if other.starts_with("--") => {
                 eprintln!("unknown option {other}\n{USAGE}");
                 exit(2);
@@ -62,16 +103,16 @@ fn main() {
         }
     }
     match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["analyze", rom] => analyze(rom),
+        ["analyze", rom] => analyze(rom, &options),
         ["build", rom] => build(rom, None, &options),
         ["build", rom, dir] => build(rom, Some(Path::new(dir)), &options),
         ["port", rom, dir] => port(rom, Path::new(dir), &options),
-        ["hints", rom] => hints(rom, None),
-        ["hints", rom, file] => hints(rom, Some(Path::new(file))),
+        ["hints", rom] => hints(rom, None, &options),
+        ["hints", rom, file] => hints(rom, Some(Path::new(file)), &options),
         #[cfg(feature = "verify")]
-        ["verify", rom, library] => check(rom, Path::new(library), 500),
+        ["verify", rom, library] => check(rom, Path::new(library), 500, &options),
         #[cfg(feature = "verify")]
-        ["verify", rom, library, count] => check(rom, Path::new(library), count.parse().unwrap_or(500)),
+        ["verify", rom, library, count] => check(rom, Path::new(library), count.parse().unwrap_or(500), &options),
         #[cfg(not(feature = "verify"))]
         ["verify", ..] => {
             eprintln!("this build has no verify, build it with --features verify");
@@ -85,12 +126,12 @@ fn main() {
 }
 
 /// the title and its programs, the executable first and then its modules.
-fn load(path: &str) -> (Title, Vec<(String, Program)>) {
+fn load(path: &str, mods: Mods) -> (Title, Vec<(String, Program)>) {
     let title = Title::load(path).unwrap_or_else(|error| {
         eprintln!("could not load {path}, {error}");
         exit(1);
     });
-    let programs = recomp3ds::programs(&title, Mods::default()).unwrap_or_else(|error| {
+    let programs = recomp3ds::programs(&title, mods).unwrap_or_else(|error| {
         eprintln!("could not read the code, {error}");
         exit(1);
     });
@@ -100,8 +141,9 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
 /// prints the section of hints.txt for the game at path, the places in the
 /// hints Zakuro wrote next to its library, or in file, that start functions
 /// the analysis does not find, along with those the list has already.
-fn hints(path: &str, file: Option<&Path>) {
-    let (title, programs) = load(path);
+fn hints(path: &str, file: Option<&Path>, options: &Options) {
+    let files = |path: &str| options.mod_file(path);
+    let (title, programs) = load(path, options.mods(&files));
     let Some((_, program)) = programs.iter().find(|(name, _)| name == "executable") else {
         eprintln!("{path} has no executable");
         exit(1);
@@ -132,7 +174,9 @@ fn hints(path: &str, file: Option<&Path>) {
 /// builds the library in dir, or when there is none in the cache, and then
 /// installs it where hosts look for it.
 fn build(path: &str, given: Option<&Path>, options: &Options) {
-    let build_options = build::Options { dir: given, overrides: options.overrides.as_deref(), ..build::Options::default() };
+    let files = |path: &str| options.mod_file(path);
+    let build_options =
+        build::Options { dir: given, overrides: options.overrides.as_deref(), mods: options.mods(&files), ..build::Options::default() };
     if let Err(error) = build::build(Path::new(path), &build_options, &print_event) {
         eprintln!("{error}");
         exit(1);
@@ -159,7 +203,8 @@ fn print_event(event: Event) {
 
 /// a Cargo project at dir that builds the title into a program of its own.
 fn port(path: &str, dir: &Path, options: &Options) {
-    let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), Mods::default(), &print_event)
+    let files = |path: &str| options.mod_file(path);
+    let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), options.mods(&files), &print_event)
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             exit(1);
@@ -192,21 +237,28 @@ fn port(path: &str, dir: &Path, options: &Options) {
 /// runs up to count of the recompiled functions of each program against
 /// the interpreter, the modules one at a time, each loaded at the same place.
 #[cfg(feature = "verify")]
-fn check(path: &str, library: &Path, count: usize) {
-    let (title, programs) = load(path);
+fn check(path: &str, library: &Path, count: usize, options: &Options) {
+    let files = |path: &str| options.mod_file(path);
+    let mods = options.mods(&files);
+    let (title, programs) = load(path, mods);
     let mut library = abi::Library::open(library).unwrap_or_else(|error| {
         eprintln!("could not open {}, {error}", library.display());
         exit(1);
     });
-    let image = image::Image::from_title(&title).unwrap_or_else(|error| {
-        eprintln!("could not read the code, {error}");
-        exit(1);
-    });
+    // the mod's code where its exheader, or else the title's, lays it
+    let exheader = mods.exheader.filter(|ex| ex.len() >= 0x400).map(rom::ExHeader::read).unwrap_or_else(|| title.exheader.clone());
+    let image = match mods.code {
+        Some(code) => image::Image::from_code(&exheader, code),
+        None => image::Image::from_title(&title).unwrap_or_else(|error| {
+            eprintln!("could not read the code, {error}");
+            exit(1);
+        }),
+    };
     let regions = verify::regions(
         (image.text.base, &image.text.bytes),
         (image.rodata.base, &image.rodata.bytes),
         (image.data.base, &image.data.bytes),
-        title.exheader.bss_size,
+        exheader.bss_size,
     );
     let start = std::time::Instant::now();
 
@@ -219,8 +271,8 @@ fn check(path: &str, library: &Path, count: usize) {
     print_report("executable", &executable);
 
     let mut modules = verify::Report::default();
-    let files = module_files(&title, Mods::default());
-    let crs = static_module(&title, Mods::default());
+    let files = module_files(&title, mods);
+    let crs = static_module(&title, mods);
     for (module, bytes) in &files {
         let Some(index) = library.module_index(&module.name) else { continue };
         let Some(program) = module.program(bytes, &imported(&files, crs.as_ref(), module)) else { continue };
@@ -274,8 +326,9 @@ fn print_report(name: &str, report: &verify::Report) {
     );
 }
 
-fn analyze(path: &str) {
-    let (title, mut programs) = load(path);
+fn analyze(path: &str, options: &Options) {
+    let files = |path: &str| options.mod_file(path);
+    let (title, mut programs) = load(path, options.mods(&files));
     let module_count = programs.len() - 1;
     let start = std::time::Instant::now();
     let mut analyses: Vec<Analysis> = programs.iter().map(|(_, program)| discover::analyze(program)).collect();
