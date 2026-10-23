@@ -100,7 +100,10 @@ pub fn write_project(dir: &Path, name: &str, title: &str, program_id: u64, zakur
         Some(path) => {
             let path = std::fs::canonicalize(path).map_err(|e| format!("could not find {}, {e}", path.display()))?;
             let krate = if path.join("crates/zakuro/Cargo.toml").exists() { path.join("crates/zakuro") } else { path };
-            format!("{{ path = \"{}\" }}", krate.display())
+            // a literal string, which a Windows path's backslashes don't
+            // escape in, and without the \\?\ canonicalize puts before one
+            let krate = krate.display().to_string();
+            format!("{{ path = '{}' }}", krate.strip_prefix(r"\\?\").unwrap_or(&krate))
         }
         None => format!("{{ git = \"{ZAKURO}\" }}"),
     };
