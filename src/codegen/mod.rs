@@ -297,6 +297,14 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
                 size = 0;
             }
         }
+        // each program's code ends its own file, so that functions found
+        // in one, by hints that only ever find them in the executable, leave
+        // the files of the others as they were, and their objects with them
+        if !source.is_empty() {
+            sources.push(std::mem::take(&mut source));
+            included.clear();
+            size = 0;
+        }
 
         // every label the host can resume at, preferring the function that
         // starts there
@@ -625,10 +633,10 @@ mod tests {
         assert_eq!(pieces, [(0x100, 0x110), (0x110, 0x118), (0x118, 0x120), (0x120, 0x130), (0x200, 0x204)]);
     }
 
-    /// a file holding functions of the executable and of a module declares
-    /// what both use.
+    /// each program's functions go in files of their own, which compile
+    /// with what they declare.
     #[test]
-    fn units_that_share_a_file_compile() {
+    fn units_get_files_of_their_own_and_compile() {
         let program = Program {
             text: Segment { base: BASE, bytes: [0xEB00_0000u32, 0xE12F_FF1E, 0xE12F_FF1E].iter().flat_map(|w| w.to_le_bytes()).collect() },
             seeds: vec![(BASE, Source::Entry)],
@@ -641,13 +649,15 @@ mod tests {
             Unit { module: Some("Second"), program: &program, analysis: &analysis },
         ];
         let files: BTreeMap<String, String> = generate(&units, &[]).into_iter().collect();
-        let code = &files["code000.c"];
-        assert!(code.contains("#include \"m001_functions.h\"") && code.contains("#include \"m002_functions.h\""));
+        assert!(files["code000.c"].contains("#include \"functions.h\"") && !files["code000.c"].contains("m001_functions.h"));
+        assert!(files["code001.c"].contains("#include \"m001_functions.h\"") && !files["code001.c"].contains("m002_functions.h"));
+        let code = &files["code002.c"];
+        assert!(code.contains("#include \"m002_functions.h\""));
         assert!(code.contains("STALE_CHECK(m002_recomp_stale[1])"));
         assert!(code.contains("if (LIKELY(target == (module_base + m002_recomp_starts[1])))"));
         assert!(files["entries.c"].contains("{2, 2, m002_origin_pieces, m002_origin_functions, m002_origin_runs, m002_origin_owners, m002_recomp_stale, m002_recomp_starts},"));
 
-        compiles("units", &files, &["code000.c", "entries.c"]);
+        compiles("units", &files, &["code000.c", "code001.c", "code002.c", "entries.c"]);
     }
 
     #[test]
