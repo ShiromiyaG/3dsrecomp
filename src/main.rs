@@ -23,11 +23,15 @@ usage, 3dsrecomp analyze <rom>
        3dsrecomp port <rom> <dir> [--overrides <file or dir>] [--name <name>] [--zakuro <checkout>]
        3dsrecomp verify <rom> <library> [count]
        3dsrecomp hints <rom> [<hints file>]
+       3dsrecomp symbols <rom> <dir>
 each takes --mods <dir>, a mod or an unpacked update laid out the way
 Luma3DS has them, code.bin (decompressed, or in exefs/), exheader.bin and
 romfs/, read in place of the game's own code and modules. build and port
 take --hot <file>, the heat Zakuro --heat wrote, to build only the
 functions the game spends nearly all its time in, in a fraction of the time.
+
+symbols writes, for each program, the names the title's modules and its
+static.crs export and the functions the analysis finds, for a disassembler.
 
 build without a dir works in the cache and installs the library where
 Zakuro finds it on its own. hints prints the game's section for hints.txt,
@@ -112,6 +116,7 @@ fn main() {
         ["build", rom] => build(rom, None, &options),
         ["build", rom, dir] => build(rom, Some(Path::new(dir)), &options),
         ["port", rom, dir] => port(rom, Path::new(dir), &options),
+        ["symbols", rom, dir] => symbols(rom, Path::new(dir), &options),
         ["hints", rom] => hints(rom, None, &options),
         ["hints", rom, file] => hints(rom, Some(Path::new(file)), &options),
         #[cfg(feature = "verify")]
@@ -174,6 +179,60 @@ fn hints(path: &str, file: Option<&Path>, options: &Options) {
     for address in new {
         println!("{address:08X}");
     }
+}
+
+/// writes dir/<program>.txt for each program: a line for each name its CRO,
+/// or static.crs for the executable, exports, and one for each function the
+/// analysis finds that has none, f_ or t_ and its address. a line is
+/// "name address kind", kind f for an ARM function, t for a Thumb one and l
+/// for data. the executable's addresses are where it is loaded, a module's
+/// are offsets in its file, as overrides and Zakuro's heat name them.
+fn symbols(path: &str, dir: &Path, options: &Options) {
+    let files = |path: &str| options.mod_file(path);
+    let mods = options.mods(&files);
+    let (title, programs) = load(path, mods);
+    let modules = recomp3ds::module_files(&title, mods);
+    let crs = recomp3ds::static_module(&title, mods);
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("could not create {}, {error}", dir.display());
+        exit(1);
+    }
+    let (mut named, mut found) = (0, 0);
+    for (name, program) in &programs {
+        let exporter = match name.as_str() {
+            "executable" => crs.as_ref(),
+            _ => modules.iter().map(|(module, _)| module).find(|module| module.name == *name),
+        };
+        let analysis = discover::analyze(program);
+        let thumb = |at: u32| at & 1 != 0 || analysis.functions.get(&(at & !1)).is_some_and(|f| f.mode == Mode::Thumb);
+        let mut text = format!("# {name}: name address kind (f ARM function, t Thumb function, l data)\n");
+        let mut has_name = std::collections::BTreeSet::new();
+        for (symbol, tag) in exporter.map(|module| module.exports.as_slice()).unwrap_or_default() {
+            let (at, kind) = match exporter.and_then(|module| module.code_address(*tag)) {
+                Some(at) => (at & !1, if thumb(at) { 't' } else { 'f' }),
+                None => match exporter.and_then(|module| module.resolve(*tag)) {
+                    Some(at) => (at, 'l'),
+                    None => continue,
+                },
+            };
+            text.push_str(&format!("{symbol} {at:08X} {kind}\n"));
+            has_name.insert(at);
+            named += 1;
+        }
+        for (&entry, function) in &analysis.functions {
+            if has_name.insert(entry) {
+                let kind = if function.mode == Mode::Thumb { 't' } else { 'f' };
+                text.push_str(&format!("{kind}_{entry:08X} {entry:08X} {kind}\n"));
+                found += 1;
+            }
+        }
+        let file = dir.join(format!("{name}.txt"));
+        if let Err(error) = std::fs::write(&file, text) {
+            eprintln!("could not write {}, {error}", file.display());
+            exit(1);
+        }
+    }
+    println!("{} programs, {named} exported names, {found} functions found without one, in {}", programs.len(), dir.display());
 }
 
 /// builds the library in dir, or when there is none in the cache, and then
