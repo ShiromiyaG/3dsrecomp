@@ -24,7 +24,9 @@ usage, 3dsrecomp analyze <rom>
        3dsrecomp verify <rom> <library> [count]
        3dsrecomp hints <rom> [<hints file>]
        3dsrecomp symbols <rom> <dir>
-each takes --mods <dir>, a mod or an unpacked update laid out the way
+each takes --decomp <dir>, code written apart from the game (decomp.bin and
+decomp.txt) that replaces some of its functions, see src/decomp.rs, and
+--mods <dir>, a mod or an unpacked update laid out the way
 Luma3DS has them, code.bin (decompressed, or in exefs/), exheader.bin and
 romfs/, read in place of the game's own code and modules. build and port
 take --hot <file>, the heat Zakuro --heat wrote, to build only the
@@ -48,6 +50,8 @@ struct Options {
     zakuro: Option<PathBuf>,
     /// what a mod's folder changes in the title.
     mods: Option<ModDir>,
+    /// code written apart from the title, linked at an address of its own.
+    decomp: Option<recomp3ds::decomp::Decomp>,
     /// Zakuro's heat, to build only the hottest functions.
     hot: Option<PathBuf>,
 }
@@ -55,8 +59,9 @@ struct Options {
 impl Options {
     /// what the mod changes, files reading its RomFS files.
     fn mods<'a>(&'a self, files: recomp3ds::Files<'a>) -> Mods<'a> {
-        let Some(dir) = &self.mods else { return Mods::default() };
-        Mods { code: dir.code.as_deref(), exheader: dir.exheader.as_deref(), romfs: dir.romfs.is_some().then_some(files) }
+        let decomp = self.decomp.as_ref();
+        let Some(dir) = &self.mods else { return Mods { decomp, ..Mods::default() } };
+        Mods { code: dir.code.as_deref(), exheader: dir.exheader.as_deref(), romfs: dir.romfs.is_some().then_some(files), decomp }
     }
 
     /// the RomFS file at path the mod gives, none to keep the title's.
@@ -103,6 +108,12 @@ fn main() {
             "--name" => options.name = Some(value()),
             "--zakuro" => options.zakuro = Some(value().into()),
             "--mods" => options.mods = Some(ModDir::read(Path::new(&value()))),
+            "--decomp" => {
+                options.decomp = Some(recomp3ds::decomp::Decomp::read(Path::new(&value())).unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    exit(2);
+                }))
+            }
             "--hot" => options.hot = Some(value().into()),
             other if other.starts_with("--") => {
                 eprintln!("unknown option {other}\n{USAGE}");

@@ -24,6 +24,7 @@ pub mod build;
 pub mod codegen;
 pub mod compile;
 pub mod cro;
+pub mod decomp;
 pub mod discover;
 pub mod hot;
 pub mod image;
@@ -53,6 +54,9 @@ pub struct Mods<'a> {
     /// and spelled the way the title has them, like static.crs or
     /// cro/Battle.cro.
     pub romfs: Option<Files<'a>>,
+    /// code written apart from the title that replaces some of its
+    /// functions, see decomp.
+    pub decomp: Option<&'a decomp::Decomp>,
 }
 
 /// the bytes that replace the RomFS file at a path, None to keep the
@@ -78,6 +82,10 @@ pub fn programs(title: &Title, mods: Mods) -> Result<Vec<(String, Program)>, Err
         }
         None => image::Image::from_title(title)?,
     };
+    let mut image = image;
+    if let Some(decomp) = mods.decomp {
+        decomp.patch(&mut image.text);
+    }
     let files = module_files(title, mods);
     let crs = static_module(title, mods);
     let exports = crs.as_ref().map(|module| module.code_exports()).unwrap_or_default();
@@ -86,6 +94,9 @@ pub fn programs(title: &Title, mods: Mods) -> Result<Vec<(String, Program)>, Err
     programs.extend(files.iter().filter_map(|(module, bytes)| {
         Some((module.name.clone(), module.program(bytes, &imported(&files, crs.as_ref(), module))?))
     }));
+    // the module list is by name and in this order everywhere, so the code
+    // written apart goes last
+    programs.extend(mods.decomp.map(|decomp| (decomp::NAME.to_owned(), decomp.program())));
     Ok(programs)
 }
 
