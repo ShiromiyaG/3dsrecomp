@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub const HEADER: &str = include_str!("../recomp.h");
 
 /// the interface version, which code has to match to be run.
-pub const ABI: u32 = 4;
+pub const ABI: u32 = 5;
 
 /// the code generator's version, raised when the code it makes runs much
 /// better or does more than before, which checking itself against memory did
@@ -63,6 +63,8 @@ pub struct Host {
     pub write32: unsafe extern "C" fn(*mut Context, u32, u32),
     pub interpret: unsafe extern "C" fn(*mut Context, u32, u32),
     pub lookup: unsafe extern "C" fn(*mut Context, u32) -> Option<Code>,
+    /// runs the guest on until it gets to an address, see recomp.h.
+    pub run: unsafe extern "C" fn(*mut Context, u32),
 }
 
 #[repr(C)]
@@ -358,6 +360,18 @@ impl Library {
         unsafe { std::slice::from_raw_parts(self.modules, self.module_count) }
     }
 
+    /// a symbol the library exports besides the tables, such as one an
+    /// override marked RECOMP_EXPORT. none for code linked in.
+    pub fn symbol(&self, name: &[u8]) -> Option<*const c_void> {
+        #[cfg(feature = "load")]
+        if let Some(library) = &self._library {
+            // SAFETY: only the address is taken, the caller gives it a type
+            return unsafe { library.get::<*const c_void>(name).ok().map(|symbol| *symbol) };
+        }
+        let _ = name;
+        None
+    }
+
     /// how many functions and modules there is code for.
     pub fn describe(&self) -> String {
         format!("{} entry points, {} modules", self.count, self.module_count)
@@ -468,7 +482,7 @@ int main(void) {
     AT(Context, user);
     SIZE(Host);
     AT(Host, read8); AT(Host, read16); AT(Host, read32); AT(Host, write8);
-    AT(Host, write16); AT(Host, write32); AT(Host, interpret); AT(Host, lookup);
+    AT(Host, write16); AT(Host, write32); AT(Host, interpret); AT(Host, lookup); AT(Host, run);
     SIZE(Entry);
     AT(Entry, address); AT(Entry, code);
     SIZE(Module);
@@ -580,7 +594,7 @@ int main(void) {
         let mut lines = Vec::new();
         at!(lines, Context, r, n, z, c, v, q, thumb, ge, exclusive, budget, exit, svc, depth, exclusive_address, tls,
             read_pages, write_pages, vfp, fpscr, host, user);
-        at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup);
+        at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup, run);
         at!(lines, Entry, address, code);
         at!(lines, Module, name, base, size, count, entries);
         at!(lines, Piece, start, end, hash);

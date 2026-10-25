@@ -76,7 +76,26 @@ RECOMP_OVERRIDE(0x00112120) {
 ```
 
 When the original returns, `r15` already holds the address it returned to,
-so the override can simply return too. `build` warns about an override
+so the override can simply return too.
+
+`CALL` returns from the override as well when the original stops partway:
+a system call, the budget running out, or code the build left out all hand
+the thread to the host, which carries on from the guest's return address.
+Code after a `CALL` then never runs. When there is more to do after the call,
+use `CALL_WHOLE`, which has the host run the original to its end first:
+
+```c
+RECOMP_OVERRIDE(0x00112120) {
+    uint32_t object = ctx->r[0];
+    CALL_WHOLE(RECOMP_ORIGINAL(0x00112120));
+    fprintf(stderr, "0x00112120 left %08X at +8\n", mem_read32(ctx, object + 8));
+}
+```
+
+`recomp_call_guest(ctx, address)` calls any guest function the same way,
+with the arguments set in `r0` to `r3`, on the stack and in `s0`. Both come
+back with `exit` set, and the override has to return, when the guest made a
+system call that has the thread wait. `build` warns about an override
 whose address has no generated code. There is no original to call in that
 case.
 

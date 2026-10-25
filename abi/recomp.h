@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 4
+#define RECOMP_ABI 5
 
 typedef struct Context Context;
 typedef void (*Code)(Context *);
@@ -24,6 +24,12 @@ typedef struct Host {
     void (*interpret)(Context *, uint32_t address, uint32_t opcode);
     /* the code for an address, bit 0 set for Thumb, or null. */
     Code (*lookup)(Context *, uint32_t address);
+    /* runs the guest on from r15, after whatever exit stopped the code,
+       until it gets to stop, then comes back with exit EXIT_NONE. for C
+       calling into the guest, see recomp_call_guest. exit is set again when
+       it cannot go on there, a system call that would block, and the C has
+       to return to the host then. */
+    void (*run)(Context *, uint32_t stop);
 } Host;
 
 /* why the code gave control back to the host. */
@@ -620,6 +626,46 @@ static void vfp_vector(Context *ctx, int op, int wide, int d, int n, int m) {
     code(ctx); \
     ctx->depth--; \
     if (UNLIKELY(ctx->exit)) return; \
+    SYNC_IN(); \
+} while (0)
+
+/* where a call from C into the guest returns to. no code is there, the
+   host's run stops when the guest gets back to it. */
+#define RECOMP_RETURN_TO_C 0xFFFFFFF0u
+
+/* runs the guest function at address, bit 0 set for Thumb, to its end, with
+   the arguments in r0 to r3, on the stack and in s0 as the caller set them,
+   the result in r0 after. unlike CALL it comes back even when the guest
+   makes a system call or leaves the recompiled code on the way, the host
+   runs it to the end, and the instructions count against the budget. exit
+   is set when it could not, and the caller has to return then. */
+static inline void recomp_call_guest(Context *ctx, uint32_t address) {
+    uint32_t lr = ctx->r[14];
+    ctx->r[14] = RECOMP_RETURN_TO_C;
+    ctx->thumb = address & 1;
+    ctx->r[15] = address & ~1u;
+    ctx->exit = EXIT_NONE;
+    ctx->depth++;
+    ctx->host->run(ctx, RECOMP_RETURN_TO_C);
+    ctx->depth--;
+    if (!ctx->exit) ctx->r[14] = lr;
+}
+
+/* CALL for an override that has more to do after the call: the code runs
+   to its end, as with recomp_call_guest, and r15 is the override's return
+   address after, as after CALL. */
+#define CALL_WHOLE(code) do { \
+    uint32_t lr_ = ctx->r[14]; \
+    SYNC_OUT(); \
+    ctx->r[14] = RECOMP_RETURN_TO_C; \
+    ctx->depth++; \
+    code(ctx); \
+    if (ctx->exit || ctx->r[15] != RECOMP_RETURN_TO_C || ctx->thumb) ctx->host->run(ctx, RECOMP_RETURN_TO_C); \
+    ctx->depth--; \
+    if (UNLIKELY(ctx->exit)) return; \
+    ctx->r[14] = lr_; \
+    ctx->thumb = lr_ & 1; \
+    ctx->r[15] = lr_ & (ctx->thumb ? ~1u : ~3u); \
     SYNC_IN(); \
 } while (0)
 

@@ -246,7 +246,52 @@ unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
     unsafe { (*run_of(ctx).library).lookup(address) }
 }
 
-static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup };
+/// runs on to stop for C calling into the guest, with the code where there
+/// is any and the interpreter elsewhere. there is no kernel here, so a
+/// system call ends it.
+unsafe extern "C" fn run(ctx: *mut Context, stop: u32) {
+    unsafe {
+        let budget = (*ctx).budget;
+        let mut left = LIMIT;
+        loop {
+            let pending = (*run_of(ctx)).pending.take();
+            if pending.is_some() || (*ctx).exit == abi::EXIT_SVC || left <= 0 {
+                (*run_of(ctx)).pending = pending;
+                (*ctx).exit = abi::EXIT_UNWIND;
+                break;
+            }
+            (*ctx).exit = abi::EXIT_NONE;
+            if (*ctx).r[15] == stop && (*ctx).thumb == 0 {
+                break;
+            }
+            if let Some(code) = (*run_of(ctx).library).lookup((*ctx).r[15] | (*ctx).thumb as u32) {
+                (*ctx).budget = left;
+                code(ctx);
+                left = (*ctx).budget;
+                if (*ctx).exit == abi::EXIT_BUDGET {
+                    (*ctx).exit = abi::EXIT_NONE;
+                }
+                continue;
+            }
+            let run = run_of(ctx);
+            let ctx = &mut *ctx;
+            load(ctx, &mut run.cpu);
+            let exit = run.cpu.step(&mut run.memory);
+            store(&run.cpu, ctx);
+            left -= 1;
+            run.interpreted += 1;
+            if let Some(Exit::Supervisor(number)) = exit {
+                ctx.svc = number;
+                ctx.exit = abi::EXIT_SVC;
+            } else {
+                run.pending = exit;
+            }
+        }
+        (*ctx).budget = budget - (LIMIT - left);
+    }
+}
+
+static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, run };
 
 fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.regs = ctx.r;

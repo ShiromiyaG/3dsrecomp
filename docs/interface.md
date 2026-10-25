@@ -55,6 +55,9 @@ library of an older generation, or one without the symbol, still runs.
 Building it again brings the improvements, which a host can suggest. In Rust, `Library::generation` reads it, 0 when it is missing, and
 `recomp_abi::GENERATION` is the current one.
 
+Overrides can export symbols of their own with `RECOMP_EXPORT`, for a host
+that knows to look for them. `Library::symbol` finds one by name.
+
 ### Entries
 
 ```c
@@ -249,6 +252,7 @@ typedef struct Host {
     void (*write32)(Context *, uint32_t, uint32_t);
     void (*interpret)(Context *, uint32_t address, uint32_t opcode);
     Code (*lookup)(Context *, uint32_t address);
+    void (*run)(Context *, uint32_t stop);
 } Host;
 ```
 
@@ -277,6 +281,23 @@ typedef struct Host {
   It is usually the same search the host's own run loop does. When it returns
   null, the code sets `exit` to `EXIT_UNWIND`, with `r[15]` holding the
   target.
+- **`run`.** It is for C calling into the guest: an override, or a function
+  written by hand, that has more to do after the call. The generated code
+  never calls it. It goes on from where the code stopped, whatever `exit`
+  says, until `r[15]` is `stop` in ARM state, and returns with `exit` at
+  `EXIT_NONE`:
+  - an `EXIT_SVC` or an `svc` its interpreter meets is carried out there, as
+    the host's own loop would;
+  - it runs the code where `lookup` finds some, and its interpreter
+    elsewhere;
+  - the budget does not stop it, and what it ran is taken off the budget
+    after.
+
+  When it cannot go on, say a system call that makes the thread wait, it sets
+  `exit` again and returns, and the C returns to the host like any code
+  that exits. `recomp_call_guest` and `CALL_WHOLE` in `recomp.h` use it, with
+  `RECOMP_RETURN_TO_C` as the return address and as `stop`. Interface 5 added
+  it.
 
 ## Exits
 
