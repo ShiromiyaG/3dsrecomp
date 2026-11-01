@@ -43,7 +43,7 @@ impl Decomp {
                 "entry" => decomp.entries.push(number(1)?),
                 "hook" => decomp.hooks.push((number(1)?, number(2)?)),
                 // a module's function, hooked by the emulator as the module loads
-                "module_hook" | "module_import" => {}
+                "module_hook" | "module_import" | "symbol" => {}
                 other => return Err(format!("decomp.txt: '{other}' is not a line it knows")),
             }
         }
