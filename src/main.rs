@@ -30,7 +30,10 @@ decomp.txt) that replaces some of its functions, see src/decomp.rs, and
 Luma3DS has them, code.bin (decompressed, or in exefs/), exheader.bin and
 romfs/, read in place of the game's own code and modules. build and port
 take --hot <file>, the heat Zakuro --heat wrote, to build only the
-functions the game spends nearly all its time in, in a fraction of the time.
+functions the game spends nearly all its time in, in a fraction of the time,
+with those the host was seen to interpret (its hints); with --cold-fast as
+well, build all of it, the rest compiled without optimizing, three times
+faster.
 
 symbols writes, for each program, the names the title's modules and its
 static.crs export and the functions the analysis finds, for a disassembler.
@@ -54,6 +57,8 @@ struct Options {
     decomp: Option<recomp3ds::decomp::Decomp>,
     /// Zakuro's heat, to build only the hottest functions.
     hot: Option<PathBuf>,
+    /// with hot: all of it, the rest unoptimized
+    cold_fast: bool,
 }
 
 impl Options {
@@ -115,6 +120,7 @@ fn main() {
                 }))
             }
             "--hot" => options.hot = Some(value().into()),
+            "--cold-fast" => options.cold_fast = true,
             other if other.starts_with("--") => {
                 eprintln!("unknown option {other}\n{USAGE}");
                 exit(2);
@@ -255,6 +261,7 @@ fn build(path: &str, given: Option<&Path>, options: &Options) {
         overrides: options.overrides.as_deref(),
         mods: options.mods(&files),
         hot: options.hot.as_deref(),
+        cold_fast: options.cold_fast,
         ..build::Options::default()
     };
     if let Err(error) = build::build(Path::new(path), &build_options, &print_event) {
@@ -412,7 +419,7 @@ fn analyze(path: &str, options: &Options) {
     let module_count = programs.len() - 1;
     let start = std::time::Instant::now();
     let mut analyses: Vec<Analysis> = programs.iter().map(|(_, program)| discover::analyze(program)).collect();
-    let functions = build::apply_hints(&title, &mut programs, &mut analyses);
+    let (functions, _) = build::apply_hints(&title, &mut programs, &mut analyses);
     let elapsed = start.elapsed();
 
     println!("title       {}, {} modules", title.exheader.title, module_count);

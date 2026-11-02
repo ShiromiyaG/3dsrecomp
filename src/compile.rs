@@ -9,7 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// floating point has to round exactly the way the interpreter does, so
 /// nothing may be fused into a multiply-add.
-const FLAGS: &[&str] = &["-O2", "-ffp-contract=off", "-fno-math-errno", "-w"];
+const FLAGS: &[&str] = &["-ffp-contract=off", "-fno-math-errno", "-w"];
+/// how much each file is optimized: all of it, but code that nearly never
+/// runs compiles three times faster without (a fast compile's cold files)
+const OPTIMIZED: &str = "-O2";
+const QUICK: &str = "-O0";
 /// what only matters for ELF and Mach-O, and that compilers for Windows
 /// refuse or ignore.
 const UNIX_FLAGS: &[&str] = &["-fPIC", "-fvisibility=hidden"];
@@ -186,7 +190,20 @@ pub fn compile(
     progress: Progress,
     background: bool,
 ) -> Result<(), String> {
-    shared(compiler, &objects(compiler, dir, sources, progress, background)?, library)
+    compile_with(compiler, dir, sources, library, progress, background, &|_| false)
+}
+
+/// compile, the sources quick says compiled without optimizing.
+pub fn compile_with(
+    compiler: &Compiler,
+    dir: &Path,
+    sources: &[String],
+    library: &Path,
+    progress: Progress,
+    background: bool,
+    quick: &(dyn Fn(&str) -> bool + Sync),
+) -> Result<(), String> {
+    shared(compiler, &objects_with(compiler, dir, sources, progress, background, quick)?, library)
 }
 
 /// compiles sources, file names inside dir, each into an object beside it,
@@ -200,6 +217,18 @@ pub fn objects(
     sources: &[String],
     progress: Progress,
     background: bool,
+) -> Result<Vec<PathBuf>, String> {
+    objects_with(compiler, dir, sources, progress, background, &|_| false)
+}
+
+/// objects, the sources quick says compiled without optimizing.
+pub fn objects_with(
+    compiler: &Compiler,
+    dir: &Path,
+    sources: &[String],
+    progress: Progress,
+    background: bool,
+    quick: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<Vec<PathBuf>, String> {
     let gcc = compiler.is_gcc();
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -249,7 +278,8 @@ pub fn objects(
                 let path = dir.join(source);
                 // an object compiled before from the same C, with the same
                 // compiler and flags, is kept
-                let key = std::fs::read(&path).ok().map(|bytes| format!("{:016x}", fnv(base, &bytes)));
+                let level = if quick(source) { QUICK } else { OPTIMIZED };
+                let key = std::fs::read(&path).ok().map(|bytes| format!("{:016x}", fnv(fnv(base, level.as_bytes()), &bytes)));
                 let key_path = path.with_extension("key");
                 let object = path.with_extension("o");
                 let kept = key.as_ref().is_some_and(|key| {
@@ -272,6 +302,7 @@ pub fn objects(
                     lower(&mut command);
                 }
                 let status = command
+                    .arg(level)
                     .args(FLAGS)
                     .args(if gcc { GCC_FLAGS } else { &[] })
                     .args(if cfg!(windows) { &[][..] } else { UNIX_FLAGS })
@@ -393,7 +424,7 @@ mod tests {
         let folder = format!("3dsrecomp {}{}", "a folder with a long name ".repeat(3), std::process::id());
         let dir = std::env::temp_dir().join(folder);
         std::fs::create_dir_all(&dir).unwrap();
-        let sources: Vec<String> = (0..400).map(|i| format!("code{i:03}.c")).collect();
+        let sources: Vec<String> = (0..400).map(|i| format!("code_{i:04}.c")).collect();
         for (i, source) in sources.iter().enumerate() {
             std::fs::write(dir.join(source), format!("int f{i}(void) {{ return {i}; }}\n")).unwrap();
         }

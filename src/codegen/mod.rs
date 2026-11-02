@@ -90,6 +90,9 @@ fn words(out: &mut String, load: bool, words: &[String]) {
         }
         return;
     }
+    // the slow way, a word at a time, in one call out of line: written out
+    // here it was most of what a transfer made the compiler work through
+    let count = words.len();
     if load {
         emit!(out, "    {{ const uint8_t *span = mem_read_span(ctx, p, {bytes}u);");
         emit!(out, "    if (LIKELY(span)) {{");
@@ -97,8 +100,9 @@ fn words(out: &mut String, load: bool, words: &[String]) {
             emit!(out, "    {destination} = load32(span + {});", i * 4);
         }
         emit!(out, "    }} else {{");
+        emit!(out, "    uint32_t words_[{count}]; mem_read_words(ctx, READ_PAGES(ctx), p, words_, {count}u);");
         for (i, destination) in words.iter().enumerate() {
-            emit!(out, "    {destination} = mem_read32(ctx, p + {}u);", i * 4);
+            emit!(out, "    {destination} = words_[{i}];");
         }
     } else {
         emit!(out, "    {{ uint8_t *span = mem_write_span(ctx, p, {bytes}u);");
@@ -107,9 +111,7 @@ fn words(out: &mut String, load: bool, words: &[String]) {
             emit!(out, "    store32(span + {}, {value});", i * 4);
         }
         emit!(out, "    }} else {{");
-        for (i, value) in words.iter().enumerate() {
-            emit!(out, "    mem_write32(ctx, p + {}u, {value});", i * 4);
-        }
+        emit!(out, "    const uint32_t words_[{count}] = {{{}}}; mem_write_words(ctx, WRITE_PAGES(ctx), p, words_, {count}u);", words.join(", "));
     }
     emit!(out, "    }} }}");
 }
@@ -127,8 +129,16 @@ fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
     false
 }
 
-/// instructions per source file, so the files compile in parallel. gcc
-/// keeps a whole file in memory, and files of 20,000 took it up to 7.8 GB.
+/// a source file holds the functions starting in 32 KiB of a program's
+/// code, about 5,000 instructions where it is dense: the files compile in
+/// parallel and none gets too big for the compiler's memory (gcc keeps a
+/// whole file, and files of 20,000 took it up to 7.8 GB). a function found
+/// anew (by hints) only changes the file of its own stretch, so the others'
+/// objects are kept
+const FILE_SHIFT: u32 = 15;
+
+/// a stretch whose code is denser goes on into a part after another every
+/// this many instructions: one file of 11 MB held a whole build up at its end
 const FILE_SIZE: usize = 5_000;
 
 /// the instructions up to which a function another one holds is still
@@ -187,6 +197,55 @@ fn containers(functions: &BTreeMap<u32, &Function>) -> BTreeMap<u32, u32> {
         .collect()
 }
 
+/// how a build lays its functions out, for builds after it in the same
+/// place to keep what they can.
+#[derive(Default)]
+pub struct Layout {
+    /// the number each program's functions had in the build before (the
+    /// file numbers.txt), by the program's prefix ("" the executable's) and
+    /// entry: a function keeps its number, so the code of the others does
+    /// not change when one comes or goes, and their objects are kept
+    pub numbers: BTreeMap<String, BTreeMap<u32, u32>>,
+    /// for each program, the functions the game spends nearly all its time
+    /// in: in files of their own (hot_*.c), which a build can optimize
+    /// while it compiles the rest quickly (code_*.c)
+    pub hot: Option<Vec<BTreeSet<u32>>>,
+}
+
+impl Layout {
+    /// numbers.txt as generate writes it: the prefix ("-" the
+    /// executable's), the entry and its number on each line
+    pub fn read_numbers(text: &str) -> BTreeMap<String, BTreeMap<u32, u32>> {
+        let mut numbers: BTreeMap<String, BTreeMap<u32, u32>> = BTreeMap::new();
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [prefix, entry, number] = fields[..] else { continue };
+            let (Ok(entry), Ok(number)) = (u32::from_str_radix(entry, 16), number.parse::<u32>()) else { continue };
+            let prefix = if prefix == "-" { String::new() } else { prefix.to_owned() };
+            numbers.entry(prefix).or_default().insert(entry, number);
+        }
+        numbers
+    }
+}
+
+/// each function's number: the one it had before, else the next free one
+fn numbered(before: Option<&BTreeMap<u32, u32>>, entries: impl Iterator<Item = u32> + Clone) -> BTreeMap<u32, u32> {
+    let mut numbers = BTreeMap::new();
+    let mut next = before.and_then(|before| before.values().max()).map_or(0, |&max| max + 1);
+    for entry in entries.clone() {
+        if let Some(&number) = before.and_then(|before| before.get(&entry)) {
+            numbers.insert(entry, number);
+        }
+    }
+    for entry in entries {
+        numbers.entry(entry).or_insert_with(|| {
+            next += 1;
+            next - 1
+        });
+    }
+    numbers
+}
+
 /// a program to write as C, the executable or one of its modules.
 pub struct Unit<'a> {
     /// the module's name, None for the executable, whose code does not move.
@@ -198,13 +257,10 @@ pub struct Unit<'a> {
 /// the C sources for the units, the executable first, as file names and
 /// contents. the overrides take the place of the functions they replace,
 /// which overrides.h lets them still call.
-pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)> {
+pub fn generate(units: &[Unit], overrides: &[Override], layout: &Layout) -> Vec<(String, String)> {
     let mut files = vec![("recomp.h".to_owned(), HEADER.to_owned())];
-    let mut sources: Vec<String> = Vec::new();
-    let mut source = String::new();
-    // the headers the file being written includes
-    let mut included = BTreeSet::new();
-    let mut size = 0;
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut numbers_file = String::new();
     let mut tables = String::from("#include \"recomp.h\"\n");
     let mut modules = String::new();
     // each unit's Origins, the executable's first
@@ -264,15 +320,29 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         files.push((header.clone(), prototypes));
 
         let include = format!("#include \"{header}\"\n\n");
+        let numbers = numbered(layout.numbers.get(&prefix), functions.keys().copied());
+        let count = numbers.values().max().map_or(0, |&max| max as usize + 1);
+        for (entry, number) in &numbers {
+            emit!(numbers_file, "{} {entry:08X} {number}", if prefix.is_empty() { "-" } else { prefix.as_str() });
+        }
+        let hot = layout.hot.as_ref().and_then(|hot| hot.get(index));
+        // each file's C, by whether it is hot, the stretch of code and the
+        // part of it; and how far each stretch's last part has got
+        let mut files_of: BTreeMap<(bool, u32, u32), String> = BTreeMap::new();
+        let mut filled: BTreeMap<(bool, u32), (u32, usize)> = BTreeMap::new();
         // each function's labels with those after what it interprets
         let mut resumed: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-        for (number, (&entry, function)) in functions.iter().enumerate() {
-            if source.is_empty() {
-                source.push_str("#include \"recomp.h\"\n");
+        for (&entry, function) in &functions {
+            let number = numbers[&entry] as usize;
+            let stretch = entry.wrapping_sub(unit.program.text.base) >> FILE_SHIFT;
+            let is_hot = hot.is_some_and(|hot| hot.contains(&entry));
+            let part = filled.entry((is_hot, stretch)).or_insert((0, 0));
+            if part.1 >= FILE_SIZE {
+                *part = (part.0 + 1, 0);
             }
-            if included.insert(index) {
-                source.push_str(&include);
-            }
+            part.1 += function.instructions.len();
+            let part = part.0;
+            let source = files_of.entry((is_hot, stretch, part)).or_insert_with(|| format!("#include \"recomp.h\"\n{include}"));
             // written once to see what goes to the interpreter, the code
             // can stop after any of those, and then again with a label
             // after each, where the host comes back in
@@ -288,29 +358,23 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
                 }
             }
             let scope = Scope { labels: &resumable.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut source, unit.program, &scope, entry, &resumable, number);
+            write_function(source, unit.program, &scope, entry, &resumable, number);
             resumed.insert(entry, resumable.labels);
-            size += function.instructions.len();
-            if size >= FILE_SIZE {
-                sources.push(std::mem::take(&mut source));
-                included.clear();
-                size = 0;
-            }
         }
-        // each program's code ends its own file, so that functions found
-        // in one, by hints that only ever find them in the executable, leave
-        // the files of the others as they were, and their objects with them
-        if !source.is_empty() {
-            sources.push(std::mem::take(&mut source));
-            included.clear();
-            size = 0;
+        // each program's code in files of its own, named after it and the
+        // stretch, so that functions found in one leave the others' as they
+        // were, and their objects with them
+        for ((is_hot, stretch, part), source) in files_of {
+            let kind = if is_hot { "hot" } else { "code" };
+            let name = if part == 0 { format!("{kind}_{prefix}{stretch:04}.c") } else { format!("{kind}_{prefix}{stretch:04}_{part}.c") };
+            sources.push((name, source));
         }
 
         // every label the host can resume at, preferring the function that
         // starts there
         let mut entries: BTreeMap<u32, (String, u32)> = BTreeMap::new();
-        for (number, (&entry, function)) in functions.iter().enumerate() {
-            let owner = (name(&prefix, entry, function.mode == Mode::Thumb), number as u32);
+        for (&entry, function) in &functions {
+            let owner = (name(&prefix, entry, function.mode == Mode::Thumb), numbers[&entry]);
             for &label in resumed.get(&entry).unwrap_or(&function.labels) {
                 let slot = entries.entry(key(label, function.mode)).or_insert_with(|| owner.clone());
                 if label == entry {
@@ -343,10 +407,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             emit!(tables, "    {{0x{label:08X}u, {owner}}},");
         }
         emit!(tables, "}};\n");
-        write_origins(&mut tables, &mut origins, &prefix, unit.program, &functions, &entries);
-    }
-    if !source.is_empty() {
-        sources.push(source);
+        write_origins(&mut tables, &mut origins, &prefix, unit.program, &functions, &numbers, count, &entries);
     }
 
     emit!(tables, "RECOMP_EXPORT const uint32_t recomp_abi = RECOMP_ABI;");
@@ -363,7 +424,8 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         emit!(header, "\n/* the generated functions the overrides replace. */\n\n{originals}");
         files.push(("overrides.h".to_owned(), header));
     }
-    files.extend(sources.into_iter().enumerate().map(|(i, source)| (format!("code{i:03}.c"), source)));
+    files.push(("numbers.txt".to_owned(), numbers_file));
+    files.extend(sources);
     files
 }
 
@@ -396,13 +458,24 @@ fn write_origins(
     prefix: &str,
     program: &Program,
     functions: &BTreeMap<u32, &Function>,
+    numbers: &BTreeMap<u32, u32>,
+    count: usize,
     entries: &BTreeMap<u32, (String, u32)>,
 ) {
-    let count = functions.len();
+    // by number: a number no function has now (it went since the build
+    // before) starts nowhere and is made from nothing
+    let mut by_number: Vec<Option<u32>> = vec![None; count];
+    for (&entry, &number) in numbers {
+        by_number[number as usize] = Some(entry);
+    }
     emit!(tables, "RECOMP_HIDDEN uint8_t {prefix}recomp_stale[{}];", count.max(1));
-    let starts: Vec<String> = functions.keys().map(|entry| format!("0x{entry:08X}u")).collect();
+    let starts: Vec<String> = by_number
+        .iter()
+        .map(|entry| entry.map_or_else(|| format!("0x{:08X}u", recomp_abi::NO_START), |entry| format!("0x{entry:08X}u")))
+        .collect();
     emit!(tables, "RECOMP_HIDDEN uint32_t {prefix}recomp_starts[{}] = {{{}}};", count.max(1), starts.join(", "));
-    let spans: Vec<Vec<(u32, u32)>> = functions.values().map(|function| spans(program, function)).collect();
+    let spans: Vec<Vec<(u32, u32)>> =
+        by_number.iter().map(|entry| entry.map_or_else(Vec::new, |entry| spans(program, functions[&entry]))).collect();
     let pieces = pieces(spans.iter().flatten().copied());
     if pieces.is_empty() {
         emit!(origins, "    {{0, 0, 0, 0, 0, 0, {prefix}recomp_stale, {prefix}recomp_starts}},");
@@ -418,7 +491,8 @@ fn write_origins(
     }
     emit!(tables, "}};");
     let (mut made, mut runs) = (String::new(), Vec::new());
-    for (spans, entry) in spans.iter().zip(functions.keys()) {
+    for (spans, entry) in spans.iter().zip(&by_number) {
+        let entry = entry.unwrap_or(recomp_abi::NO_START);
         emit!(made, "    {{{}, {}, 0x{entry:08X}u}},", runs.len(), spans.len());
         for &(start, end) in spans {
             let first = pieces.partition_point(|&(piece, _)| piece < start);
@@ -563,7 +637,7 @@ mod tests {
         };
         let analysis = discover::analyze(&program);
         let units = [Unit { module: None, program: &program, analysis: &analysis }];
-        generate(&units, overrides).into_iter().collect()
+        generate(&units, overrides, &Layout::default()).into_iter().collect()
     }
 
     /// the files for a function that calls another, the callee replaced.
@@ -576,7 +650,7 @@ mod tests {
     fn multiple_transfers_check_one_page_for_all_their_words() {
         // push {r4, r5, lr}, vpush {d8}, vpop {d8}, pop {r4, r5, pc}
         let files = files(&[0xE92D_4030, 0xED2D_8B02, 0xECBD_8B02, 0xE8BD_8030], &[]);
-        let code = &files["code000.c"];
+        let code = &files["code_0000.c"];
         assert!(code.contains("mem_write_span(ctx, p, 12u)"));
         assert!(code.contains("store32(span + 8, reg14_);"));
         assert!(code.contains("mem_write_span(ctx, p, 8u)"));
@@ -584,7 +658,7 @@ mod tests {
         assert!(code.contains("next = load32(span + 8);"));
         assert!(code.contains("RETURN_TO_A(next);"));
 
-        compiles("transfers", &files, &["code000.c"]);
+        compiles("transfers", &files, &["code_0000.c"]);
     }
 
     /// compiles sources among files, in a folder of their own named after
@@ -609,7 +683,7 @@ mod tests {
     fn functions_say_what_they_were_made_from() {
         // bl BASE + 8, bx lr, then the callee, bx lr
         let files = generated(&[]);
-        let code = &files["code000.c"];
+        let code = &files["code_0000.c"];
         assert!(code.contains("if (LIKELY(target == recomp_starts[0])) goto L_00100000;\n    STALE_CHECK(recomp_stale[0])"));
         assert!(code.contains("STALE_CHECK(recomp_stale[1])"));
         assert!(files["entries.c"].contains("uint32_t recomp_starts[2] = {0x00100000u, 0x00100008u};"));
@@ -622,7 +696,7 @@ mod tests {
         assert!(tables.contains("static const Run origin_runs[] = {\n    {0, 1},\n    {1, 2},\n};"), "{tables}");
         assert!(tables.contains("RECOMP_EXPORT const Origins recomp_origins[] = {\n    {2, 2, origin_pieces, origin_functions, origin_runs, origin_owners, recomp_stale, recomp_starts},"));
 
-        compiles("origins", &files, &["code000.c", "entries.c"]);
+        compiles("origins", &files, &["code_0000.c", "entries.c"]);
     }
 
     /// code several functions hold is cut where any of them starts or ends,
@@ -648,16 +722,31 @@ mod tests {
             Unit { module: Some("First"), program: &program, analysis: &analysis },
             Unit { module: Some("Second"), program: &program, analysis: &analysis },
         ];
-        let files: BTreeMap<String, String> = generate(&units, &[]).into_iter().collect();
-        assert!(files["code000.c"].contains("#include \"functions.h\"") && !files["code000.c"].contains("m001_functions.h"));
-        assert!(files["code001.c"].contains("#include \"m001_functions.h\"") && !files["code001.c"].contains("m002_functions.h"));
-        let code = &files["code002.c"];
+        let files: BTreeMap<String, String> = generate(&units, &[], &Layout::default()).into_iter().collect();
+        assert!(files["code_0000.c"].contains("#include \"functions.h\"") && !files["code_0000.c"].contains("m001_functions.h"));
+        assert!(files["code_m001_0000.c"].contains("#include \"m001_functions.h\"") && !files["code_m001_0000.c"].contains("m002_functions.h"));
+        let code = &files["code_m002_0000.c"];
         assert!(code.contains("#include \"m002_functions.h\""));
         assert!(code.contains("STALE_CHECK(m002_recomp_stale[1])"));
         assert!(code.contains("if (LIKELY(target == (module_base + m002_recomp_starts[1])))"));
         assert!(files["entries.c"].contains("{2, 2, m002_origin_pieces, m002_origin_functions, m002_origin_runs, m002_origin_owners, m002_recomp_stale, m002_recomp_starts},"));
 
-        compiles("units", &files, &["code000.c", "code001.c", "code002.c", "entries.c"]);
+        compiles("units", &files, &["code_0000.c", "code_m001_0000.c", "code_m002_0000.c", "entries.c"]);
+    }
+
+    /// a function keeps the number it had, one found anew takes the next
+    /// free one, and numbers.txt reads back as written.
+    #[test]
+    fn functions_keep_their_numbers() {
+        let before: BTreeMap<u32, u32> = [(0x100, 0), (0x200, 1), (0x300, 2)].into();
+        let after = numbered(Some(&before), [0x100u32, 0x180, 0x300].into_iter());
+        assert_eq!(after, [(0x100, 0), (0x180, 3), (0x300, 2)].into());
+        let fresh = numbered(None, [0x10u32, 0x20].into_iter());
+        assert_eq!(fresh, [(0x10, 0), (0x20, 1)].into());
+        let text = "- 00000100 0\nm001_ 00000200 5\n";
+        let read = Layout::read_numbers(text);
+        assert_eq!(read[""][&0x100], 0);
+        assert_eq!(read["m001_"][&0x200], 5);
     }
 
     #[test]
@@ -692,7 +781,7 @@ RECOMP_OVERRIDE(0x00100008) {
 "#
             .to_owned(),
         );
-        compiles("overrides", &files, &["code000.c", "override.c"]);
+        compiles("overrides", &files, &["code_0000.c", "override.c"]);
     }
 
     #[test]
@@ -704,7 +793,7 @@ RECOMP_OVERRIDE(0x00100008) {
             original: "original_0x00100008".to_owned(),
         };
         let files = generated(std::slice::from_ref(&replaced));
-        let code = &files["code000.c"];
+        let code = &files["code_0000.c"];
         assert!(code.contains("CALL(override_0x00100008);"));
         assert!(files["functions.h"].contains("void override_0x00100008(Context *ctx);"));
         assert!(files["entries.c"].contains("{0x00100008u, override_0x00100008},"));
@@ -715,7 +804,7 @@ RECOMP_OVERRIDE(0x00100008) {
 
         // without overrides nothing changes
         let plain = generated(&[]);
-        assert!(plain["code000.c"].contains("CALL(f_00100008);"));
+        assert!(plain["code_0000.c"].contains("CALL(f_00100008);"));
         assert!(!plain.contains_key("overrides.h"));
     }
 }

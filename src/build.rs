@@ -44,8 +44,13 @@ pub struct Options<'a> {
     /// played meanwhile.
     pub background: bool,
     /// Zakuro's heat for the title: build only the functions that cover
-    /// nearly all of it, quickly, see hot.rs.
+    /// nearly all of it, quickly, see hot.rs, and those the host had to
+    /// interpret (its hints, what the game was seen to run).
     pub hot: Option<&'a Path>,
+    /// with hot: build all of it after all, the hot functions optimized as
+    /// always and the rest, which nearly never runs, compiled without
+    /// optimizing, three times faster (a fast compile's second build)
+    pub cold_fast: bool,
 }
 
 /// the title's code written as C.
@@ -66,6 +71,20 @@ pub fn generate(
     hot: Option<&Path>,
     events: &(dyn Fn(Event) + Sync),
 ) -> Result<Generated, String> {
+    generate_with(rom, pick, overrides, mods, hot, false, events)
+}
+
+/// generate, and with hot and cold_fast all of the code, the hot functions in
+/// files of their own (see Options::cold_fast)
+pub fn generate_with(
+    rom: &Path,
+    pick: impl FnOnce(&Title) -> PathBuf,
+    overrides: Option<&Path>,
+    mods: Mods,
+    hot: Option<&Path>,
+    cold_fast: bool,
+    events: &(dyn Fn(Event) + Sync),
+) -> Result<Generated, String> {
     let title = Title::load(rom).map_err(|error| format!("could not load {}, {error}", rom.display()))?;
     let mut programs = crate::programs(&title, mods).map_err(|error| format!("could not read the code, {error}"))?;
     let dir = pick(&title);
@@ -84,7 +103,7 @@ pub fn generate(
     }
 
     let mut analyses: Vec<Analysis> = programs.iter().map(|(_, program)| discover::analyze(program)).collect();
-    let functions = apply_hints(&title, &mut programs, &mut analyses);
+    let (functions, hinted) = apply_hints(&title, &mut programs, &mut analyses);
     if functions > 0 {
         events(Event::Note(format!("{functions} of the places Zakuro interpreted start new functions")));
     }
@@ -102,21 +121,49 @@ pub fn generate(
             )));
         }
     }
+    // the numbers the functions had in the build before here, kept
+    let mut layout = codegen::Layout::default();
+    if let Ok(text) = std::fs::read_to_string(dir.join("numbers.txt")) {
+        layout.numbers = codegen::Layout::read_numbers(&text);
+    }
     if let Some(hot) = hot {
         let heat = crate::hot::Heat::load(hot)?;
-        let selection = crate::hot::select(&programs, &analyses, &heat, crate::hot::SHARE);
-        let mut also: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
-        for item in &replaced {
-            let index = programs.iter().position(|(name, _)| Some(name.as_str()) == item.module.as_deref()).unwrap_or(0);
-            also.entry(index).or_default().insert(item.address & !1);
+        let mut selection = crate::hot::select(&programs, &analyses, &heat, crate::hot::SHARE);
+        // what the host was seen to interpret counts as hot too: the game
+        // ran it, and runs it again
+        let executable = programs.iter().position(|(name, _)| name == "executable").unwrap_or(0);
+        let mut learned = 0;
+        if let Some(analysis) = analyses.get(executable) {
+            for (&entry, function) in &analysis.functions {
+                let thumb = (function.mode == Mode::Thumb) as u32;
+                if !selection.keep[executable].contains(&entry)
+                    && hinted.iter().any(|&at| at & 1 == thumb && function.labels.contains(&(at & !1)))
+                {
+                    selection.keep[executable].insert(entry);
+                    learned += 1;
+                }
+            }
         }
-        crate::hot::prune(&mut analyses, &selection.keep, &also);
-        events(Event::Note(format!(
-            "building the {} hottest of {} functions, {:.1}% of where the game spends its time",
-            selection.functions,
-            selection.of,
-            selection.covered * 100.0
-        )));
+        if cold_fast {
+            events(Event::Note(format!(
+                "building all {} functions, the {} hottest and {learned} the game was seen to run optimized",
+                selection.of, selection.functions
+            )));
+            layout.hot = Some(selection.keep);
+        } else {
+            let mut also: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
+            for item in &replaced {
+                let index = programs.iter().position(|(name, _)| Some(name.as_str()) == item.module.as_deref()).unwrap_or(0);
+                also.entry(index).or_default().insert(item.address & !1);
+            }
+            crate::hot::prune(&mut analyses, &selection.keep, &also);
+            events(Event::Note(format!(
+                "building the {} hottest of {} functions, {:.1}% of where the game spends its time, and {learned} it was seen to run",
+                selection.functions,
+                selection.of,
+                selection.covered * 100.0
+            )));
+        }
     }
     let units: Vec<codegen::Unit> = programs
         .iter()
@@ -124,7 +171,7 @@ pub fn generate(
         .enumerate()
         .map(|(i, ((name, program), analysis))| codegen::Unit { module: (i > 0).then_some(name.as_str()), program, analysis })
         .collect();
-    let generated = codegen::generate(&units, &replaced);
+    let generated = codegen::generate(&units, &replaced, &layout);
 
     let write = |path: &Path, contents: &[u8]| {
         std::fs::write(path, contents).map_err(|error| format!("could not write {}, {error}", path.display()))
@@ -157,7 +204,7 @@ pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> 
         let cache = if options.hot.is_some() { cache.with_file_name(format!("{:016X}-hot", title.program_id())) } else { cache };
         options.dir.map(Path::to_owned).unwrap_or(cache)
     };
-    let generated = generate(rom, pick, options.overrides, options.mods, options.hot, events)?;
+    let generated = generate_with(rom, pick, options.overrides, options.mods, options.hot, options.cold_fast, events)?;
     if stopped() {
         return Err("stopped".to_owned());
     }
@@ -168,7 +215,12 @@ pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> 
         events(Event::Compiled { done, total });
         !stopped()
     };
-    compile::compile(&compiler, &generated.dir, &generated.sources, &library, &progress, options.background)?;
+    // linked beside it, then put in its place: the library being played
+    // can't be written over on Windows, but can be moved aside
+    let fresh = library.with_extension(format!("{}.new", std::env::consts::DLL_EXTENSION));
+    let quick = |source: &str| options.cold_fast && source.starts_with("code_");
+    compile::compile_with(&compiler, &generated.dir, &generated.sources, &fresh, &progress, options.background, &quick)?;
+    step_aside(&library).and_then(|()| std::fs::rename(&fresh, &library)).map_err(|error| format!("could not put {} in place, {error}", library.display()))?;
     events(Event::Built { library: library.clone(), took: start.elapsed() });
     if options.dir.is_some() {
         return Ok(library);
@@ -185,8 +237,8 @@ pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> 
 /// every way the code goes in, branch targets and the returns from calls and
 /// svcs, while Zakuro used to note where it finished a block the budget did
 /// not cover, which as labels split the hot loops into single instructions.
-pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: &mut [Analysis]) -> usize {
-    let Some(index) = programs.iter().position(|(name, _)| name == "executable") else { return 0 };
+pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: &mut [Analysis]) -> (usize, Vec<u32>) {
+    let Some(index) = programs.iter().position(|(name, _)| name == "executable") else { return (0, Vec::new()) };
     let program = &mut programs[index].1;
     let text = program.text.base..program.text.end();
     // this player's and everyone's who ran the same code
@@ -196,14 +248,14 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: 
     hinted.sort_unstable();
     hinted.dedup();
     if hinted.is_empty() {
-        return 0;
+        return (0, hinted);
     }
     let outside = new_functions(&analyses[index], &hinted);
     if !outside.is_empty() {
         program.seeds.extend(outside.iter().map(|&address| (address, Source::Hint)));
         analyses[index] = discover::analyze(program);
     }
-    outside.len()
+    (outside.len(), hinted)
 }
 
 /// the hinted places none of the functions the analysis found holds, which

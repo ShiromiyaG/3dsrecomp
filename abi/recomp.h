@@ -215,6 +215,19 @@ static ALWAYS_INLINE uint8_t *mem_span_in(uint8_t *const *pages, uint32_t addres
     return page + offset;
 }
 
+/* a load or store multiple whose words are not all on one page the code
+   reaches directly: a word at a time, out of line, so the code making the
+   transfer stays small */
+static __attribute__((noinline, cold)) void mem_read_words(Context *ctx, uint8_t *const *pages, uint32_t address, uint32_t *words,
+                                                           uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) words[i] = mem_read32_in(ctx, pages, address + i * 4);
+}
+
+static __attribute__((noinline, cold)) void mem_write_words(Context *ctx, uint8_t *const *pages, uint32_t address,
+                                                            const uint32_t *words, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) mem_write32_in(ctx, pages, address + i * 4, words[i]);
+}
+
 #define mem_read8(c, address) mem_read8_in((c), READ_PAGES(c), (address))
 #define mem_read16(c, address) mem_read16_in((c), READ_PAGES(c), (address))
 #define mem_read32(c, address) mem_read32_in((c), READ_PAGES(c), (address))
