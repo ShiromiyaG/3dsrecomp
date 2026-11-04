@@ -44,8 +44,8 @@ impl Decomp {
                 "hook" => decomp.hooks.push((number(1)?, number(2)?)),
                 // a module's function, hooked by the emulator as the module loads;
                 // a variable the host reads or writes; a word the host changes
-                // as the game loads
-                "module_hook" | "module_import" | "symbol" | "patch" => {}
+                // as the game loads; an option the host shows and writes
+                "module_hook" | "module_import" | "symbol" | "patch" | "option" => {}
                 other => return Err(format!("decomp.txt: '{other}' is not a line it knows")),
             }
         }
